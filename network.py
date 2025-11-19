@@ -80,16 +80,24 @@ class NetworkHandler:
     
     def _connect_to_peers(self):
         """Connect to all known peers with better logic"""
-        time.sleep(2)  # Wait a bit before starting connections
+        time.sleep(3)  # Wait a bit before starting connections
+        
+        connection_attempts = {}
         
         while self.is_running:
             known_peers = self.config.get_known_peers()
             
             for peer in known_peers:
                 if peer.id != self.config.peer_id:  # Don't connect to ourselves
-                    self._connect_to_peer(peer)
+                    # Only attempt connection if we're not already connected
+                    if peer.id not in self.connected_peers:
+                        # Limit connection attempts to once every 30 seconds
+                        last_attempt = connection_attempts.get(peer.id, 0)
+                        if time.time() - last_attempt > 30:
+                            connection_attempts[peer.id] = time.time()
+                            self._connect_to_peer(peer)
             
-            time.sleep(10)  # Retry every 10 seconds
+            time.sleep(5)  # Check every 5 seconds
     
     def _connect_to_peer(self, peer: Peer):
         """Connect to a specific peer"""
@@ -172,11 +180,22 @@ class NetworkHandler:
     
     def _receive_messages(self, sock, peer: Peer):
         """Continuously receive messages from a peer"""
+        consecutive_timeouts = 0
+        max_timeouts = 3
+        
         while self.is_running:
             try:
                 data = self._receive_data(sock)
                 if not data:
-                    break
+                    # No data received (could be timeout or closed connection)
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= max_timeouts:
+                        print(f"Too many timeouts from {peer.id}, disconnecting")
+                        break
+                    continue
+                
+                # Reset timeout counter on successful receive
+                consecutive_timeouts = 0
                 
                 message = NetworkMessage.from_bytes(data)
                 self._handle_message(message, peer)
@@ -191,40 +210,57 @@ class NetworkHandler:
         print(f"Disconnected from peer {peer.id}")
     
     def _handle_message(self, message: NetworkMessage, peer: Peer):
-            """Handle incoming network message"""
-            try:
-                if message.message_type == MessageType.FILE_CHANGE:
-                    print(f"Received file change from {peer.id}: {message.data['change_type']} - {message.data['file_path']}")
-                    # Convert back to FileChange object
-                    change_data = message.data
-                    
-                    # Convert string back to ChangeType enum
-                    change_type = ChangeType(change_data['change_type'])
-                    
-                    change = FileChange(
-                        change_type=change_type,  # Use the enum here
-                        file_path=change_data['file_path'],
-                        old_path=change_data.get('old_path'),
-                        is_directory=change_data.get('is_directory', False)
-                    )
-                    # Apply the change locally
-                    self.sync_engine.apply_remote_change(change)
-                    
-                    # If it's a file creation/modification, request the file content
-                    if change.change_type in [ChangeType.CREATED, ChangeType.MODIFIED] and not change.is_directory:
-                        self._request_file_content(change.file_path, peer)
+        """Handle incoming network message"""
+        try:
+            print(f"📨 Processing {message.message_type.value} from {peer.id}")
+            
+            if message.message_type == MessageType.FILE_CHANGE:
+                print(f"Received file change from {peer.id}: {message.data['change_type']} - {message.data['file_path']}")
+                # Convert back to FileChange object
+                change_data = message.data
                 
-                elif message.message_type == MessageType.FILE_REQUEST:
-                    self._send_file_content(message.data['file_path'], peer)
+                # Convert string back to ChangeType enum
+                change_type = ChangeType(change_data['change_type'])
                 
-                elif message.message_type == MessageType.FILE_DATA:
-                    self._save_file_content(message.data)
+                change = FileChange(
+                    change_type=change_type,
+                    file_path=change_data['file_path'],
+                    old_path=change_data.get('old_path'),
+                    is_directory=change_data.get('is_directory', False)
+                )
+                # Apply the change locally
+                self.sync_engine.apply_remote_change(change)
                 
-                elif message.message_type == MessageType.HELLO:
-                    print(f"Peer {peer.id} says hello")
+                # If it's a file creation/modification, request the file content
+                if change.change_type in [ChangeType.CREATED, ChangeType.MODIFIED] and not change.is_directory:
+                    self._request_file_content(change.file_path, peer)
+            
+            elif message.message_type == MessageType.FILE_REQUEST:
+                print(f"Received file request for: {message.data['file_path']}")
+                self._send_file_content(message.data['file_path'], peer)
+            
+            elif message.message_type == MessageType.FILE_DATA:
+                print(f"Received file data for: {message.data['file_path']}")
+                self._save_file_content(message.data)
+            
+            elif message.message_type == MessageType.HELLO:
+                print(f"Peer {peer.id} says hello")
+            
+            elif message.message_type == MessageType.PING:
+                # Send pong response
+                pong_msg = NetworkMessage(
+                    message_type=MessageType.PONG,
+                    sender_id=self.config.peer_id,
+                    data={}
+                )
+                if peer.id in self.connected_peers:
+                    sock, addr = self.connected_peers[peer.id]
+                    self._send_message(sock, pong_msg)
                     
-            except Exception as e:
-                print(f"Error handling message from {peer.id}: {e}")
+        except Exception as e:
+            print(f"❌ Error handling message from {peer.id}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def broadcast_change(self, change: FileChange):
         """Broadcast file change to all connected peers"""
@@ -322,47 +358,32 @@ class NetworkHandler:
             print(f"Error saving file {file_path}: {e}")
     
     def _send_message(self, sock, message: NetworkMessage):
-        """Send message over socket"""
+        """Send message over socket - simplified protocol"""
         try:
             data = message.to_bytes()
-            # Send message length first
-            sock.sendall(len(data).to_bytes(4, byteorder='big'))
-            # Send message data
+            # Simple approach: just send the data without length prefix
             sock.sendall(data)
+            print(f"📤 Sent {message.message_type.value} message to peer")
         except Exception as e:
             raise Exception(f"Failed to send message: {e}")
-    
+
     def _receive_data(self, sock):
-            """Receive data from socket with better error handling"""
-            try:
-                sock.settimeout(5.0)  # Add timeout to prevent hanging
+        """Receive data from socket - simplified protocol"""
+        try:
+            sock.settimeout(5.0)
+            
+            # Simple approach: receive whatever data is available
+            data = sock.recv(8192)  # Increased buffer size
+            if not data:
+                return None
+            
+            print(f"📥 Received {len(data)} bytes from peer")
+            return data
                 
-                # First receive the message length
-                length_data = b''
-                while len(length_data) < 4:
-                    chunk = sock.recv(4 - len(length_data))
-                    if not chunk:
-                        return None
-                    length_data += chunk
-                
-                message_length = int.from_bytes(length_data, byteorder='big')
-                
-                if message_length > 100 * 1024 * 1024:  # 100MB max
-                    raise Exception("Message too large")
-                
-                # Receive the actual message data
-                chunks = []
-                bytes_received = 0
-                while bytes_received < message_length:
-                    chunk = sock.recv(min(message_length - bytes_received, 4096))
-                    if not chunk:
-                        return None
-                    chunks.append(chunk)
-                    bytes_received += len(chunk)
-                
-                return b''.join(chunks)
-                
-            except socket.timeout:
-                raise Exception("Receive timeout")
-            except Exception as e:
-                raise Exception(f"Failed to receive data: {e}")
+        except socket.timeout:
+            # Timeout is normal when no data is available
+            return None
+        except Exception as e:
+            raise Exception(f"Failed to receive data: {e}")
+    
+    
