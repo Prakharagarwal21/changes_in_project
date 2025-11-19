@@ -79,30 +79,40 @@ class NetworkHandler:
             print(f"Server error: {e}")
     
     def _connect_to_peers(self):
-        """Connect to all known peers"""
+        """Connect to all known peers with better logic"""
+        time.sleep(2)  # Wait a bit before starting connections
+        
         while self.is_running:
             known_peers = self.config.get_known_peers()
             
             for peer in known_peers:
-                if peer.id not in self.connected_peers and peer.id != self.config.peer_id:
+                if peer.id != self.config.peer_id:  # Don't connect to ourselves
                     self._connect_to_peer(peer)
             
-            time.sleep(5)  # Retry every 5 seconds
+            time.sleep(10)  # Retry every 10 seconds
     
     def _connect_to_peer(self, peer: Peer):
         """Connect to a specific peer"""
+        # Don't connect if we already have this peer connected
+        if peer.id in self.connected_peers:
+            return
+            
         try:
+            print(f"Attempting to connect to {peer.host}:{peer.port}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
+            sock.settimeout(5)
             sock.connect((peer.host, peer.port))
             
-            # Send hello message
+            # Send hello message immediately
             hello_msg = NetworkMessage(
                 message_type=MessageType.HELLO,
                 sender_id=self.config.peer_id,
                 data={"port": self.config.port}
             )
             self._send_message(sock, hello_msg)
+            
+            # Store the connection
+            self.connected_peers[peer.id] = (sock, (peer.host, peer.port))
             
             # Start receiving messages from this peer
             receive_thread = threading.Thread(
@@ -112,10 +122,14 @@ class NetworkHandler:
             )
             receive_thread.start()
             
-            print(f"Connected to peer {peer.id} at {peer.host}:{peer.port}")
+            print(f"✅ Successfully connected to peer {peer.id} at {peer.host}:{peer.port}")
             
+        except socket.timeout:
+            print(f"⏰ Connection timeout to {peer.host}:{peer.port}")
+        except ConnectionRefusedError:
+            print(f"❌ Connection refused by {peer.host}:{peer.port} (peer may not be running)")
         except Exception as e:
-            print(f"Failed to connect to {peer.host}:{peer.port}: {e}")
+            print(f"❌ Failed to connect to {peer.host}:{peer.port}: {e}")
     
     def _handle_client_connection(self, client_socket, address):
             """Handle incoming client connection"""
